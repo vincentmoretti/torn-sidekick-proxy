@@ -1,101 +1,110 @@
-// Faster, Edge-based scanner with concurrency + small defaults
-export const config = { runtime: 'edge' };
+// api/market/scan.js
+// Node serverless (default) + defensive guards + small defaults
+export default async function handler(req, res) {
+  try {
+    const key = process.env.TORN_API_KEY;
+    if (!key) return res.status(500).json({ error: "Missing TORN_API_KEY env var" });
 
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { 'content-type': 'application/json' }
-  });
-}
+    // ---------- params ----------
+    const q = req.query || {};
+    const minPrice     = Number(q.minPrice    ?? 1000);
+    const margin       = Number(q.margin      ?? 5);    // % under median to flag
+    const needListings = Number(q.needListings?? 10);   // liquidity floor
+    const category     = (q.category || "").toString().toLowerCase(); // "energy drink", "alcohol", etc.
+    const maxItems     = Math.max(1, Math.min(12, Number(q.maxItems ?? 12))); // keep small for speed
 
-export default async function handler(req) {
-  const url = new URL(req.url);
-  const key = process.env.TORN_API_KEY;
-  if (!key) return json({ error: 'Missing TORN_API_KEY env var' }, 500);
+    const base = "https://api.torn.com";
+    const ua = { headers: { "User-Agent": "TornSidekick/1.0" } };
 
-  const minPrice = Number(url.searchParams.get('minPrice') ?? 1000);
-  const margin = Number(url.searchParams.get('margin') ?? 5);
-  const needListings = Number(url.searchParams.get('needListings') ?? 10);
-  const category = (url.searchParams.get('category') || '').toLowerCase();
-  const maxItems = Math.max(1, Math.min(12, Number(url.searchParams.get('maxItems') ?? 12))); // cap low for speed
+    // ---------- 1) load catalog ----------
+    let itemsData;
+    try {
+      const r = await fetch(`${base}/torn/?selections=items&key=${key}`, ua);
+      itemsData = await r.json();
+    } catch (e) {
+      return res.status(502).json({ error: "Failed to fetch items catalog", detail: String(e) });
+    }
+    const items = itemsData?.items || {};
 
-  const base = 'https://api.torn.com';
-  const ua = { headers: { 'User-Agent': 'TornSidekick/1.0' } };
+    // ---------- 2) candidates ----------
+    let candidates = Object.entries(items)
+      .map(([id, meta]) => ({ item_id: Number(id), name: meta?.name || `item_${id}`, type: (meta?.type || "") }))
+      .filter(x => !category || x.type.toLowerCase() === category)
+      .slice(0, maxItems);
 
-  // 1) Load item catalog (server-side; fine here)
-  const itemsResp = await fetch(`${base}/torn/?selections=items&key=${key}`, ua);
-  const itemsData = await itemsResp.json();
-  const items = itemsData?.items || {};
-
-  // 2) Candidate set
-  let candidates = Object.entries(items)
-    .map(([id, meta]) => ({ item_id: Number(id), name: meta.name, type: meta.type }))
-    .filter(x => !category || (x.type || '').toLowerCase() === category)
-    .slice(0, maxItems);
-
-  // 3) Utils
-  async function getListings(id) {
-    const r = await fetch(`${base}/v2/market/${id}/itemmarket?key=${key}`, ua);
-    try { return await r.json(); } catch { return {}; }
-  }
-  const chunk = (arr, n) => arr.reduce((acc, _, i) => (i % n ? acc : [...acc, arr.slice(i, i+n)]), []);
-
-  const results = [];
-  const concurrency = 6; // small batch to stay friendly
-
-  for (const group of chunk(candidates, concurrency)) {
-    const groupData = await Promise.all(group.map(c =>
-      getListings(c.item_id)
-        .then(d => ({ c, d }))
-        .catch(() => ({ c, d: {} }))
-    ));
-
-    for (const { c, d } of groupData) {
-      const list = (d?.itemmarket || [])
-        .map(x => ({ price: Number(x.cost), qty: Number(x.quantity || 1), seller: x.ID || '' }))
-        .filter(x => Number.isFinite(x.price))
-        .sort((a, b) => a.price - b.price);
-
-      const prices = list.map(x => x.price);
+    // ---------- helpers ----------
+    async function getListings(id) {
+      try {
+        const r = await fetch(`${base}/v2/market/${id}/itemmarket?key=${key}`, ua);
+        return await r.json();
+      } catch {
+        return { itemmarket: [] };
+      }
+    }
+    function stats(listings) {
+      const prices = (listings || []).map(x => Number(x.cost)).filter(Number.isFinite).sort((a,b)=>a-b);
       const n = prices.length;
-      if (!n || n < needListings) continue;
-
-      const median = n % 2 ? prices[(n - 1) / 2] : Math.round((prices[n / 2 - 1] + prices[n / 2]) / 2);
+      if (!n) return null;
+      const mid = n / 2;
+      const median = n % 2 ? prices[(n-1)/2] : Math.round((prices[mid-1] + prices[mid]) / 2);
       const p10 = prices[Math.floor((n - 1) * 0.10)];
       const p90 = prices[Math.floor((n - 1) * 0.90)];
-      const low = prices[0];
+      return { n, low: prices[0], median, p10, p90 };
+    }
 
-      if (low < minPrice) continue;
+    // ---------- 3) fetch in small batches ----------
+    const chunk = (arr, n) => arr.reduce((acc, _, i) => (i % n ? acc : [...acc, arr.slice(i, i+n)]), []);
+    const results = [];
+    const errors = [];
+    const concurrency = 5;
 
-      const thresh = Math.round(median * (1 - margin / 100));
-      const deals = list
-        .filter(x => x.price <= thresh)
-        .slice(0, 3)
-        .map(x => ({
+    for (const group of chunk(candidates, concurrency)) {
+      const settled = await Promise.allSettled(group.map(c => getListings(c.item_id).then(d => ({ c, d }))));
+
+      for (const s of settled) {
+        if (s.status !== "fulfilled") { errors.push(String(s.reason)); continue; }
+        const { c, d } = s.value;
+        const list = (d?.itemmarket || [])
+          .map(x => ({ price: Number(x.cost), qty: Number(x.quantity || 1), seller: x.ID || "" }))
+          .filter(x => Number.isFinite(x.price))
+          .sort((a,b) => a.price - b.price);
+
+        const S = stats(list);
+        if (!S) continue;
+        if (S.n < needListings) continue;
+        if (S.low < minPrice) continue;
+
+        const thresh = Math.round(S.median * (1 - margin/100));
+        const deals = list.filter(x => x.price <= thresh).slice(0, 3).map(x => ({
           price: x.price,
           qty: x.qty,
           seller: x.seller,
-          pct_under: Math.round((1 - x.price / median) * 1000) / 10
+          pct_under: Math.round((1 - x.price / S.median) * 1000)/10
         }));
 
-      // require at least two cheap listings to avoid single-outlier traps
-      if (deals.length >= 2) {
-        results.push({
-          item_id: c.item_id,
-          name: c.name,
-          type: c.type,
-          n_listings: n,
-          low,
-          median,
-          p10,
-          p90,
-          deals
-        });
+        // require at least TWO cheap listings to avoid single-outlier traps
+        if (deals.length >= 2) {
+          results.push({
+            item_id: c.item_id, name: c.name, type: c.type,
+            n_listings: S.n, low: S.low, median: S.median, p10: S.p10, p90: S.p90,
+            deals
+          });
+        }
       }
     }
-  }
 
-  results.sort((a, b) => (b.deals[0]?.pct_under || 0) - (a.deals[0]?.pct_under || 0));
-  return json({ params: { minPrice, margin, needListings, category, maxItems }, count: results.length, results });
+    results.sort((a,b) => (b.deals[0]?.pct_under || 0) - (a.deals[0]?.pct_under || 0));
+
+    return res.status(200).json({
+      params: { minPrice, margin, needListings, category, maxItems },
+      count: results.length,
+      results,
+      warnings: errors.length ? ["Some items failed to fetch; partial results returned"] : []
+    });
+  } catch (err) {
+    // last-resort guard so you get JSON instead of a 500 page
+    return res.status(500).json({ error: "scan crashed", detail: String(err) });
+  }
 }
+
 
