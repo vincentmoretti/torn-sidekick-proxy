@@ -1,11 +1,10 @@
 // api/market/scan.js
-// Node serverless (default) + defensive guards + small defaults
+// Node serverless + defensive guards + small defaults
 export default async function handler(req, res) {
   try {
     const key = process.env.TORN_API_KEY;
     if (!key) return res.status(500).json({ error: "Missing TORN_API_KEY env var" });
 
-    // ---------- params ----------
     const q = req.query || {};
     const minPrice     = Number(q.minPrice    ?? 1000);
     const margin       = Number(q.margin      ?? 5);    // % under median to flag
@@ -16,7 +15,7 @@ export default async function handler(req, res) {
     const base = "https://api.torn.com";
     const ua = { headers: { "User-Agent": "TornSidekick/1.0" } };
 
-    // ---------- 1) load catalog ----------
+    // 1) load catalog
     let itemsData;
     try {
       const r = await fetch(`${base}/torn/?selections=items&key=${key}`, ua);
@@ -26,23 +25,29 @@ export default async function handler(req, res) {
     }
     const items = itemsData?.items || {};
 
-    // ---------- 2) candidates ----------
+    // 2) candidates
     let candidates = Object.entries(items)
       .map(([id, meta]) => ({ item_id: Number(id), name: meta?.name || `item_${id}`, type: (meta?.type || "") }))
       .filter(x => !category || x.type.toLowerCase() === category)
       .slice(0, maxItems);
 
-    // ---------- helpers ----------
+    // helpers
     async function getListings(id) {
       try {
         const r = await fetch(`${base}/v2/market/${id}/itemmarket?key=${key}`, ua);
-        return await r.json();
+        const d = await r.json();
+        return d;
       } catch {
         return { itemmarket: [] };
       }
     }
+    function toArray(maybe) {
+      if (Array.isArray(maybe)) return maybe;
+      if (maybe && typeof maybe === "object") return Object.values(maybe);
+      return [];
+    }
     function stats(listings) {
-      const prices = (listings || []).map(x => Number(x.cost)).filter(Number.isFinite).sort((a,b)=>a-b);
+      const prices = listings.map(x => Number(x.cost)).filter(Number.isFinite).sort((a,b)=>a-b);
       const n = prices.length;
       if (!n) return null;
       const mid = n / 2;
@@ -51,20 +56,22 @@ export default async function handler(req, res) {
       const p90 = prices[Math.floor((n - 1) * 0.90)];
       return { n, low: prices[0], median, p10, p90 };
     }
-
-    // ---------- 3) fetch in small batches ----------
     const chunk = (arr, n) => arr.reduce((acc, _, i) => (i % n ? acc : [...acc, arr.slice(i, i+n)]), []);
     const results = [];
     const errors = [];
     const concurrency = 5;
 
     for (const group of chunk(candidates, concurrency)) {
-      const settled = await Promise.allSettled(group.map(c => getListings(c.item_id).then(d => ({ c, d }))));
+      const settled = await Promise.allSettled(
+        group.map(c => getListings(c.item_id).then(d => ({ c, d })))
+      );
 
       for (const s of settled) {
         if (s.status !== "fulfilled") { errors.push(String(s.reason)); continue; }
         const { c, d } = s.value;
-        const list = (d?.itemmarket || [])
+
+        // ✅ normalize itemmarket to array
+        const list = toArray(d?.itemmarket)
           .map(x => ({ price: Number(x.cost), qty: Number(x.quantity || 1), seller: x.ID || "" }))
           .filter(x => Number.isFinite(x.price))
           .sort((a,b) => a.price - b.price);
@@ -75,14 +82,17 @@ export default async function handler(req, res) {
         if (S.low < minPrice) continue;
 
         const thresh = Math.round(S.median * (1 - margin/100));
-        const deals = list.filter(x => x.price <= thresh).slice(0, 3).map(x => ({
-          price: x.price,
-          qty: x.qty,
-          seller: x.seller,
-          pct_under: Math.round((1 - x.price / S.median) * 1000)/10
-        }));
+        const deals = list
+          .filter(x => x.price <= thresh)
+          .slice(0, 3)
+          .map(x => ({
+            price: x.price,
+            qty: x.qty,
+            seller: x.seller,
+            pct_under: Math.round((1 - x.price / S.median) * 1000)/10
+          }));
 
-        // require at least TWO cheap listings to avoid single-outlier traps
+        // require at least two cheap listings to avoid single-outlier traps
         if (deals.length >= 2) {
           results.push({
             item_id: c.item_id, name: c.name, type: c.type,
@@ -94,17 +104,15 @@ export default async function handler(req, res) {
     }
 
     results.sort((a,b) => (b.deals[0]?.pct_under || 0) - (a.deals[0]?.pct_under || 0));
-
     return res.status(200).json({
       params: { minPrice, margin, needListings, category, maxItems },
       count: results.length,
-      results,
-      warnings: errors.length ? ["Some items failed to fetch; partial results returned"] : []
+      results
     });
   } catch (err) {
-    // last-resort guard so you get JSON instead of a 500 page
     return res.status(500).json({ error: "scan crashed", detail: String(err) });
   }
 }
+
 
 
