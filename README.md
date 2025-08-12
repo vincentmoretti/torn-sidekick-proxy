@@ -1,27 +1,32 @@
 # Torn Sidekick Proxy
 
-This is a tiny Vercel serverless project that exposes two endpoints the Custom GPT can call.
+Tiny Vercel serverless project that exposes two read-only endpoints your Custom GPT can call.
 
-Endpoints
-export default async function handler(req, res) {
-  const key = process.env.TORN_API_KEY;
-  if (!key) return res.status(500).json({ error: "Missing TORN_API_KEY env var" });
+## Endpoints
+- `GET /api/torn/items` — Torn items metadata (ids, names, types)
+- `GET /api/market/item/{itemId}` — Item Market listings for a specific item (API v2)
 
-  const { itemId } = req.query;
-  // ✅ API v2 path: selection in the path, not in ?selections=
-  const url = `https://api.torn.com/market/${itemId}/itemmarket?key=${key}`;
+## Environment Variables
+- `TORN_API_KEY` — your Torn API key (set in Vercel Project → Settings → Environment Variables)
 
-  const r = await fetch(url, { headers: { "User-Agent": "TornSidekick/1.0" } });
-  const text = await r.text();
-  res.status(r.status).send(text);
-}
+## Deploy (GitHub + Vercel)
+1) Upload these files to the repo root:
+   - `api/torn/items.js`
+   - `api/market/item/[itemId].js`
+   - `package.json`
+   - `README.md`
+2) In Vercel: **New Project → Import** this repo → **Deploy**.
+3) In Vercel → Project **Settings → Environment Variables**, add `TORN_API_KEY` (Production + Preview).
+4) Trigger a new build (Redeploy the latest or make a tiny README edit).
 
+## Test
+- `https://YOUR_DOMAIN.vercel.app/api/torn/items`
+- `https://YOUR_DOMAIN.vercel.app/api/market/item/261`
 
-Environment variable
-- TORN_API_KEY, set this in Vercel Project Settings
+You should get JSON. If you see “Missing TORN_API_KEY,” set the env var and redeploy.
 
-Deploy steps
-1, Push these files to a new GitHub repo, or upload with GitHub web
-2, On Vercel, New Project, Import your repo, Deploy
-3, In Vercel Project Settings, Environment Variables, add TORN_API_KEY with your Torn key, then redeploy
-4, Test, https, your-project.vercel.app/api/torn/items should return JSON
+## Notes
+- API v2 is required for `itemmarket`. The handler uses:
+  `https://api.torn.com/v2/market/{itemId}/itemmarket?key=...`
+- Seeing a 404 at the site root `/` is normal (we didn’t make a homepage).
+  Optional: create `api/index.js` to return `{ ok: true }`.
