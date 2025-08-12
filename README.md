@@ -3,8 +3,19 @@
 This is a tiny Vercel serverless project that exposes two endpoints the Custom GPT can call.
 
 Endpoints
-- /api/torn/items, returns Torn items metadata
-- /api/market/item/[itemId], returns Item Market listings for a specific item id
+export default async function handler(req, res) {
+  const key = process.env.TORN_API_KEY;
+  if (!key) return res.status(500).json({ error: "Missing TORN_API_KEY env var" });
+
+  const { itemId } = req.query;
+  // ✅ API v2 path: selection in the path, not in ?selections=
+  const url = `https://api.torn.com/market/${itemId}/itemmarket?key=${key}`;
+
+  const r = await fetch(url, { headers: { "User-Agent": "TornSidekick/1.0" } });
+  const text = await r.text();
+  res.status(r.status).send(text);
+}
+
 
 Environment variable
 - TORN_API_KEY, set this in Vercel Project Settings
